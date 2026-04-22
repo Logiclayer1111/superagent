@@ -1,3 +1,4 @@
+
 /**
  * Return the mime type for the given `str`.
  *
@@ -71,6 +72,11 @@ exports.cleanHeader = (header, changesOrigin) => {
   return header;
 };
 
+exports.normalizeHostname = (hostname) => {
+  const [,normalized] = hostname.match(/^\[([^\]]+)\]$/) || [];
+  return normalized || hostname;
+};
+
 /**
  * Check if `obj` is an object.
  *
@@ -104,4 +110,24 @@ exports.mixin = (target, source) => {
       target[key] = source[key];
     }
   }
+};
+
+/**
+ * Check if the response is compressed using Gzip or Deflate.
+ * @param {Object} res
+ * @return {Boolean}
+ */
+
+exports.isGzipOrDeflateEncoding = (res) => {
+  return new RegExp(/^\s*(?:deflate|gzip)\s*$/).test(res.headers['content-encoding']);
+};
+
+/**
+ * Check if the response is compressed using Brotli.
+ * @param {Object} res
+ * @return {Boolean}
+ */
+
+exports.isBrotliEncoding = (res) => {
+  return new RegExp(/^\s*(?:br)\s*$/).test(res.headers['content-encoding']);
 };

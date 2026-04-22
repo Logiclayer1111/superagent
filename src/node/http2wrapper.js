@@ -1,16 +1,7 @@
+const http2 = require('http2');
 const Stream = require('stream');
 const net = require('net');
 const tls = require('tls');
-// eslint-disable-next-line node/no-deprecated-api
-const { parse } = require('url');
-const process = require('process');
-const semverGte = require('semver/functions/gte');
-
-let http2;
-
-if (semverGte(process.version, 'v10.10.0')) http2 = require('http2');
-else
-  throw new Error('superagent: this version of Node.js does not support http2');
 
 const {
   HTTP2_HEADER_PATH,
@@ -28,6 +19,10 @@ function setProtocol(protocol) {
       return new Request(protocol, options);
     }
   };
+}
+
+function normalizeIpv6Host(host) {
+  return net.isIP(host) === 6 ? `[${host}]` : host;
 }
 
 class Request extends Stream {
@@ -57,11 +52,12 @@ class Request extends Stream {
 
     this._headers = {};
 
+    const normalizedHost = normalizeIpv6Host(host);
     const session = http2.connect(
-      `${protocol}//${host}:${port}`,
+      `${protocol}//${normalizedHost}:${port}`,
       sessionOptions
     );
-    this.setHeader('host', `${host}:${port}`);
+    this.setHeader('host', `${normalizedHost}:${port}`);
 
     session.on('error', (error) => this.emit('error', error));
 
@@ -152,7 +148,7 @@ class Request extends Stream {
         case HTTP2_HEADER_HOST:
           key = HTTP2_HEADER_AUTHORITY;
           value = /^http:\/\/|^https:\/\//.test(value)
-            ? parse(value).host
+            ? new URL(value).host
             : value;
           break;
         default:

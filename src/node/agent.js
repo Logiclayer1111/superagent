@@ -2,8 +2,6 @@
  * Module dependencies.
  */
 
-// eslint-disable-next-line node/no-deprecated-api
-const { parse } = require('url');
 const { CookieJar } = require('cookiejar');
 const { CookieAccessInfo } = require('cookiejar');
 const methods = require('methods');
@@ -55,7 +53,7 @@ class Agent extends AgentBase {
   _saveCookies (res) {
     const cookies = res.headers['set-cookie'];
     if (cookies) {
-      const url = parse(res.request?.url || '');
+      const url = new URL(res.request?.url || '');
       this.jar.setCookies(cookies, url.hostname, url.pathname);
     }
   }
@@ -67,7 +65,7 @@ class Agent extends AgentBase {
    * @api private
    */
   _attachCookies (request_) {
-    const url = parse(request_.url);
+    const url = new URL(request_.url);
     const access = new CookieAccessInfo(
       url.hostname,
       url.pathname,
@@ -80,6 +78,7 @@ class Agent extends AgentBase {
 
 for (const name of methods) {
   const method = name.toUpperCase();
+  if (method === "QUERY") continue;
   Agent.prototype[name] = function (url, fn) {
     const request_ = new request.Request(method, url);
 

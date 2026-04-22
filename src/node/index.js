@@ -2,8 +2,7 @@
  * Module dependencies.
  */
 
-// eslint-disable-next-line node/no-deprecated-api
-const { parse, format, resolve } = require('url');
+const { format } = require('url');
 const Stream = require('stream');
 const https = require('https');
 const http = require('http');
@@ -17,19 +16,16 @@ const FormData = require('form-data');
 const formidable = require('formidable');
 const debug = require('debug')('superagent');
 const CookieJar = require('cookiejar');
-const semverGte = require('semver/functions/gte');
 const safeStringify = require('fast-safe-stringify');
 
 const utils = require('../utils');
 const RequestBase = require('../request-base');
-const { unzip } = require('./unzip');
+const http2 = require('./http2wrapper');
+const { decompress } = require('./unzip');
 const Response = require('./response');
 
-const { mixin, hasOwn } = utils;
-
-let http2;
-
-if (semverGte(process.version, 'v10.10.0')) http2 = require('./http2wrapper');
+const { mixin, hasOwn, isBrotliEncoding, isGzipOrDeflateEncoding } = utils;
+const { chooseDecompresser } = require('./decompress');
 
 function request(method, url) {
   // callback
@@ -103,7 +99,9 @@ exports.protocols = {
  */
 
 exports.serialize = {
-  'application/x-www-form-urlencoded': qs.stringify,
+  'application/x-www-form-urlencoded': (obj) => {
+    return qs.stringify(obj, { indices: false, strictNullHandling: true });
+  },
   'application/json': safeStringify
 };
 
@@ -451,9 +449,11 @@ Request.prototype._pipeContinue = function (stream, options) {
     this._emitResponse();
     if (this._aborted) return;
 
-    if (this._shouldUnzip(res)) {
-      const unzipObject = zlib.createUnzip();
-      unzipObject.on('error', (error) => {
+    if (this._shouldDecompress(res)) {
+
+      let decompresser = chooseDecompresser(res);
+
+      decompresser.on('error', (error) => {
         if (error && error.code === 'Z_BUF_ERROR') {
           // unexpected end of file is ignored by browsers and curl
           stream.emit('end');
@@ -462,14 +462,13 @@ Request.prototype._pipeContinue = function (stream, options) {
 
         stream.emit('error', error);
       });
-      res.pipe(unzipObject).pipe(stream, options);
-      // don't emit 'end' until unzipObject has completed writing all its data.
-      unzipObject.once('end', () => this.emit('end'));
+      res.pipe(decompresser).pipe(stream, options);
+      // don't emit 'end' until decompresser has completed writing all its data.
+      decompresser.once('end', () => this.emit('end'));
     } else {
       res.pipe(stream, options);
       res.once('end', () => this.emit('end'));
     }
-
   });
   return stream;
 };
@@ -504,7 +503,7 @@ Request.prototype._redirect = function (res) {
   debug('redirect %s -> %s', this.url, url);
 
   // location
-  url = resolve(this.url, url);
+  url = new URL(url, this.url).href;
 
   // ensure the response is being consumed
   // this is required for Node v0.10+
@@ -512,7 +511,7 @@ Request.prototype._redirect = function (res) {
 
   let headers = this.req.getHeaders ? this.req.getHeaders() : this.req._headers;
 
-  const changesOrigin = parse(url).host !== parse(this.url).host;
+  const changesOrigin = new URL(url).host !== new URL(this.url).host;
 
   // implementation of 302 following defacto standard
   if (res.statusCode === 301 || res.statusCode === 302) {
@@ -696,43 +695,24 @@ Request.prototype.request = function () {
     return this.emit('error', err);
   }
 
-  let { url } = this;
+  let { url: urlString } = this;
   const retries = this._retries;
 
-  // Capture backticks as-is from the final query string built above.
-  // Note: this'll only find backticks entered in req.query(String)
-  // calls, because qs.stringify unconditionally encodes backticks.
-  let queryStringBackticks;
-  if (url.includes('`')) {
-    const queryStartIndex = url.indexOf('?');
-
-    if (queryStartIndex !== -1) {
-      const queryString = url.slice(queryStartIndex + 1);
-      queryStringBackticks = queryString.match(/`|%60/g);
-    }
-  }
-
   // default to http://
-  if (url.indexOf('http') !== 0) url = `http://${url}`;
-  url = parse(url);
-
-  // See https://github.com/ladjs/superagent/issues/1367
-  if (queryStringBackticks) {
-    let i = 0;
-    url.query = url.query.replace(/%60/g, () => queryStringBackticks[i++]);
-    url.search = `?${url.query}`;
-    url.path = url.pathname + url.search;
-  }
+  if (urlString.indexOf('http') !== 0) urlString = `http://${urlString}`;
+  const url = new URL(urlString);
+  let { protocol } = url;
+  let path = `${url.pathname}${url.search}`;
 
   // support unix sockets
-  if (/^https?\+unix:/.test(url.protocol) === true) {
+  if (/^https?\+unix:/.test(protocol) === true) {
     // get the protocol
-    url.protocol = `${url.protocol.split('+')[0]}:`;
+    protocol = `${protocol.split('+')[0]}:`;
 
-    // get the socket, path
-    const unixParts = url.path.match(/^([^/]+)(.+)$/);
-    options.socketPath = unixParts[1].replace(/%2F/g, '/');
-    url.path = unixParts[2];
+    // get the socket path
+    options.socketPath = url.hostname.replace(/%2F/g, '/');
+    url.host = '';
+    url.hostname = '';
   }
 
   // Override IP address of a hostname
@@ -773,8 +753,8 @@ Request.prototype.request = function () {
   // options
   options.method = this.method;
   options.port = url.port;
-  options.path = url.path;
-  options.host = url.hostname;
+  options.path = path;
+  options.host = utils.normalizeHostname(url.hostname); // ex: [::1] -> ::1
   options.ca = this._ca;
   options.key = this._key;
   options.pfx = this._pfx;
@@ -801,8 +781,8 @@ Request.prototype.request = function () {
 
   // initiate request
   const module_ = this._enableHttp2
-    ? exports.protocols['http2:'].setProtocol(url.protocol)
-    : exports.protocols[url.protocol];
+    ? exports.protocols['http2:'].setProtocol(protocol)
+    : exports.protocols[protocol];
 
   // request
   this.req = module_.request(options);
@@ -815,7 +795,7 @@ Request.prototype.request = function () {
     req.setHeader('Accept-Encoding', 'gzip, deflate');
   }
 
-  this.protocol = url.protocol;
+  this.protocol = protocol;
   this.host = url.host;
 
   // expose events
@@ -838,9 +818,8 @@ Request.prototype.request = function () {
   });
 
   // auth
-  if (url.auth) {
-    const auth = url.auth.split(':');
-    this.auth(auth[0], auth[1]);
+  if (url.username || url.password) {
+    this.auth(url.username, url.password);
   }
 
   if (this.username && this.password) {
@@ -1071,8 +1050,8 @@ Request.prototype._end = function () {
     }
 
     // zlib support
-    if (this._shouldUnzip(res)) {
-      unzip(req, res);
+    if (this._shouldDecompress(res)) {
+      decompress(req, res);
     }
 
     let buffer = this._buffer;
@@ -1093,8 +1072,46 @@ Request.prototype._end = function () {
         parser = exports.parse.image; // It's actually a generic Buffer
         buffer = true;
       } else if (multipart) {
-        const form = formidable();
-        parser = form.parse.bind(form);
+        const form = formidable.formidable();
+        parser = (res, callback) => {
+          // Create a PassThrough stream that acts as a proper HTTP request
+          const bridgeStream = new Stream.PassThrough();
+
+          // Add HTTP request properties from the current request context
+          bridgeStream.method = this.method || 'POST';
+          bridgeStream.url = this.url || '/';
+          bridgeStream.httpVersion = res.httpVersion || '1.1';
+          bridgeStream.headers = res.headers || {};
+          bridgeStream.socket = res.socket || { readable: true };
+
+          // Pipe the response data through the bridge stream
+          res.pipe(bridgeStream);
+
+          form.parse(bridgeStream, (err, fields, files) => {
+            if (err) return callback(err);
+
+            // Formidable v3 always returns arrays, but SuperAgent expects single values
+            // Flatten single-item arrays to maintain backward compatibility
+            const flattenedFields = {};
+            if (fields) {
+              for (const key in fields) {
+                const value = fields[key];
+                flattenedFields[key] = Array.isArray(value) && value.length === 1 ? value[0] : value;
+              }
+            }
+
+            const flattenedFiles = {};
+            if (files) {
+              for (const key in files) {
+                const value = files[key];
+                flattenedFiles[key] = Array.isArray(value) && value.length === 1 ? value[0] : value;
+              }
+            }
+
+            // Return flattened fields as the object parameter to match SuperAgent's expected format
+            callback(null, flattenedFields, flattenedFiles);
+          });
+        };
         buffer = true;
       } else if (isBinary(mime)) {
         parser = exports.parse.image;
@@ -1125,7 +1142,7 @@ Request.prototype._end = function () {
     let parserHandlesEnd = false;
     if (buffer) {
       // Protectiona against zip bombs and other nuisance
-      let responseBytesLeft = this._maxResponseSize || 200_000_000;
+      let responseBytesLeft = this._maxResponseSize || 200000000;
       res.on('data', (buf) => {
         responseBytesLeft -= buf.byteLength || buf.length > 0 ? buf.length : 0;
         if (responseBytesLeft < 0) {
@@ -1276,21 +1293,10 @@ Request.prototype._end = function () {
 };
 
 // Check whether response has a non-0-sized gzip-encoded body
-Request.prototype._shouldUnzip = (res) => {
-  if (res.statusCode === 204 || res.statusCode === 304) {
-    // These aren't supposed to have any body
-    return false;
-  }
-
-  // header content is a string, and distinction between 0 and no information is crucial
-  if (res.headers['content-length'] === '0') {
-    // We know that the body is empty (unfortunately, this check does not cover chunked encoding)
-    return false;
-  }
-
-  // console.log(res);
-  return /^\s*(?:deflate|gzip)\s*$/.test(res.headers['content-encoding']);
+Request.prototype._shouldDecompress = (res) => {
+  return hasNonEmptyResponseContent(res) && (isGzipOrDeflateEncoding(res) || isBrotliEncoding(res));
 };
+
 
 /**
  * Overrides DNS for selected hostnames. Takes object mapping hostnames to IP addresses.
@@ -1411,4 +1417,19 @@ function isJSON(mime) {
 
 function isRedirect(code) {
   return [301, 302, 303, 305, 307, 308].includes(code);
+}
+
+function hasNonEmptyResponseContent(res) {
+  if (res.statusCode === 204 || res.statusCode === 304) {
+    // These aren't supposed to have any body
+    return false;
+  }
+
+  // header content is a string, and distinction between 0 and no information is crucial
+  if (res.headers['content-length'] === '0') {
+    // We know that the body is empty (unfortunately, this check does not cover chunked encoding)
+    return false;
+  }
+
+  return true;
 }
